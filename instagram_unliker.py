@@ -235,9 +235,19 @@ class InstagramUnliker:
                 logging.error(f"Failed to install ensta: {result.stderr.decode()}")
                 print(f"{ConsoleColors.RED}[✗] Failed to install ensta. Error: {result.stderr.decode()}{ConsoleColors.RESET}")
                 return False
+            
+            # Install moviepy which is required by ensta's WebSession module
+            result_moviepy = subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "moviepy"],
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE)
+            
+            if result_moviepy.returncode != 0:
+                logging.error(f"Failed to install moviepy: {result_moviepy.stderr.decode()}")
+                print(f"{ConsoleColors.RED}[✗] Failed to install moviepy. Error: {result_moviepy.stderr.decode()}{ConsoleColors.RESET}")
+                return False
                 
-            logging.info("Successfully installed ensta")
-            print(f"{ConsoleColors.GREEN}[✓] Successfully installed ensta{ConsoleColors.RESET}")
+            logging.info("Successfully installed ensta and moviepy")
+            print(f"{ConsoleColors.GREEN}[✓] Successfully installed ensta and moviepy{ConsoleColors.RESET}")
             return True
             
         except Exception as e:
@@ -271,12 +281,20 @@ class InstagramUnliker:
         """Add account with improved UI"""
         print(f"\n{ConsoleColors.CYAN}➕ Add Instagram Account{ConsoleColors.RESET}")
         print("-" * 40)
+        print(f"{ConsoleColors.YELLOW}ℹ  Instagram no longer allows direct password login via third-party tools.")
+        print(f"   You need to provide your Instagram session ID (a browser cookie) instead.")
+        print(f"\n   How to get your session ID:")
+        print(f"   1. Open Instagram in your browser and log in.")
+        print(f"   2. Open Developer Tools (F12 or Cmd+Option+I).")
+        print(f"   3. Go to Application → Cookies → https://www.instagram.com")
+        print(f"   4. Find the cookie named 'sessionid' and copy its value.{ConsoleColors.RESET}")
+        print()
         
         username = input(f"{ConsoleColors.BOLD}Username: {ConsoleColors.RESET}").strip()
-        password = input(f"{ConsoleColors.BOLD}Password: {ConsoleColors.RESET}").strip()
+        sessionid = input(f"{ConsoleColors.BOLD}Session ID (sessionid cookie): {ConsoleColors.RESET}").strip()
         
-        if not username or not password:
-            print(f"{ConsoleColors.RED}Username and password are required{ConsoleColors.RESET}")
+        if not username or not sessionid:
+            print(f"{ConsoleColors.RED}Username and session ID are required{ConsoleColors.RESET}")
             return
         
         self.accounts_dir.mkdir(exist_ok=True)
@@ -289,7 +307,7 @@ class InstagramUnliker:
         
         account_data = {
             "username": username,
-            "password": password,
+            "sessionid": sessionid,
             "last_run": None,
             "total_unliked": 0,
             "last_error": None,
@@ -385,8 +403,22 @@ class InstagramUnliker:
             print(f"{ConsoleColors.YELLOW}This will run in the background. You can close anytime.{ConsoleColors.RESET}")
             
             try:
-                from ensta import Web
-                client = Web(account_data['username'], account_data['password'])
+                from ensta import WebSession
+                sessionid = account_data.get('sessionid')
+                if not sessionid:
+                    print(f"{ConsoleColors.RED}[✗] No session ID found for @{username}.")
+                    print(f"→ Please remove and re-add this account using your Instagram session ID (sessionid cookie).{ConsoleColors.RESET}")
+                    return
+                # Only session_id is required; rur/mid/user_id/ig_did are optional browser cookies
+                # that Instagram does not strictly require for authenticated API requests.
+                session_data = json.dumps({
+                    "session_id": sessionid,
+                    "rur": "",
+                    "mid": "",
+                    "user_id": "",
+                    "ig_did": ""
+                })
+                client = WebSession(session_data)
                 print(f"{ConsoleColors.GREEN}✓ Successfully logged in{ConsoleColors.RESET}")
                 account = client.private_info()
                 print(f"{ConsoleColors.GREEN}Logged in as: {ConsoleColors.CYAN}{account.username}{ConsoleColors.RESET}")
@@ -394,7 +426,7 @@ class InstagramUnliker:
                 error_msg = f"Login failed: {str(e)}"
                 logging.error(error_msg)
                 print(f"{ConsoleColors.RED}[✗] {error_msg}")
-                print(f"→ Please check your username and password.{ConsoleColors.RESET}")
+                print(f"→ Your session ID may have expired. Please re-add your account with a fresh sessionid cookie from your browser.{ConsoleColors.RESET}")
                 return
 
             # Try to load liked posts from JSON file
@@ -838,7 +870,7 @@ class InstagramUnliker:
             logging.error(error_msg, exc_info=True)
             print(f"{ConsoleColors.RED}[✗] {error_msg}")
             print("→ Please try installing dependencies manually:{ConsoleColors.RESET}")
-            print("pip install psutil tqdm colorama requests ensta==5.2.9")
+            print("pip install psutil tqdm colorama requests ensta==5.2.9 moviepy")
             return False
 
 def ensure_python_installed():
@@ -916,7 +948,7 @@ def main():
         if not unliker.check_dependencies():
             print("Error: Failed to install required dependencies.")
             print("Please try installing them manually:")
-            print("pip install psutil tqdm colorama requests ensta")
+            print("pip install psutil tqdm colorama requests ensta==5.2.9 moviepy")
             sys.exit(1)
         
         # Continue with other checks
