@@ -481,14 +481,41 @@ class InstagramUnliker:
                                 json.dump(liked_data, f, indent=4)
                             continue
 
-                        # Support nested string_list_data format and flat href format.
-                        # In the flat format the post dict itself carries 'href' directly,
-                        # so we wrap it in a list so that string_list[0]['href'] works
-                        # uniformly for both formats below.
+                        # Support multiple Instagram data-export formats:
+                        #  - string_list_data[0]['href']  (classic format)
+                        #  - string_list_data[0]['value'] (some newer exports)
+                        #  - string_list_data[0] as a plain list ["url", ...]
+                        #  - post['href'] directly (flat format)
+                        #  - post['title'] containing the URL (some newer exports)
                         string_list = post.get('string_list_data') or []
+
+                        # Normalise list-of-lists: [["https://...", ...]] → [{'href': 'https://...'}]
+                        if string_list and isinstance(string_list[0], list):
+                            nested_list = string_list[0]
+                            extracted_url = next(
+                                (v for v in nested_list if isinstance(v, str) and v.startswith('http')),
+                                None
+                            )
+                            string_list = [{'href': extracted_url}] if extracted_url else []
+
                         if not string_list and post.get('href'):
                             string_list = [post]
-                        if not string_list or not string_list[0].get('href'):
+
+                        # Resolve the post URL from the best available field
+                        post_url = None
+                        if string_list and isinstance(string_list[0], dict):
+                            entry = string_list[0]
+                            post_url = entry.get('href') or entry.get('value') or entry.get('uri')
+                            if post_url and not str(post_url).startswith('http'):
+                                post_url = None
+
+                        # Fall back to the 'title' field if it looks like a URL
+                        if not post_url:
+                            title = post.get('title', '')
+                            if title and str(title).startswith('http'):
+                                post_url = title
+
+                        if not post_url:
                             logging.warning(f"Skipping post with missing or empty 'string_list_data' (title: {post.get('title', 'unknown')})")
                             progress_bar.update(1)
                             with open('liked_posts.json', 'w') as f:
@@ -500,7 +527,7 @@ class InstagramUnliker:
                         actual_delay = base_delay * CONFIG['accounts'][username].get('delay_multiplier', 1.0)
                         time.sleep(actual_delay)
 
-                        media_id = instagram_code_to_media_id(string_list[0]['href'])
+                        media_id = instagram_code_to_media_id(post_url)
                         
                         # Unlike with retry mechanism and detailed error logging
                         for retry in range(CONFIG['max_retries']):
