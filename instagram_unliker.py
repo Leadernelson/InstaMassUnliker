@@ -469,7 +469,14 @@ class InstagramUnliker:
                         time.sleep(actual_delay)
                         
                         post = liked_data['likes_media_likes'].pop(0)
-                        media_id = instagram_code_to_media_id(post['string_list_data'][0]['href'])
+                        string_list = post.get('string_list_data') or []
+                        if not string_list or not string_list[0].get('href'):
+                            logging.warning(f"Skipping post with missing or empty 'string_list_data': {post}")
+                            progress_bar.update(1)
+                            with open('liked_posts.json', 'w') as f:
+                                json.dump(liked_data, f, indent=4)
+                            continue
+                        media_id = instagram_code_to_media_id(string_list[0]['href'])
                         
                         # Unlike with retry mechanism and detailed error logging
                         for retry in range(CONFIG['max_retries']):
