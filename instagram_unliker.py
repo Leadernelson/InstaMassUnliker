@@ -442,7 +442,14 @@ class InstagramUnliker:
                     
                 # Support both list format and dict format from Instagram data export
                 if isinstance(liked_data, list):
-                    liked_data = {'likes_media_likes': liked_data}
+                    # Flatten if it's a list of lists (some export formats chunk posts into sublists)
+                    flattened = []
+                    for item in liked_data:
+                        if isinstance(item, list):
+                            flattened.extend(item)
+                        else:
+                            flattened.append(item)
+                    liked_data = {'likes_media_likes': flattened}
 
                 if not liked_data.get('likes_media_likes'):
                     error_msg = "No liked posts found in JSON file"
@@ -464,18 +471,35 @@ class InstagramUnliker:
                 
                 while liked_data['likes_media_likes'] and self.running:
                     try:
-                        base_delay = random.uniform(CONFIG['delay']['min'], CONFIG['delay']['max'])
-                        actual_delay = base_delay * CONFIG['accounts'][username].get('delay_multiplier', 1.0)
-                        time.sleep(actual_delay)
-                        
                         post = liked_data['likes_media_likes'].pop(0)
+
+                        # Guard against non-dict entries (e.g. list-of-lists export format)
+                        if not isinstance(post, dict):
+                            logging.warning(f"Skipping post with unexpected format: {type(post).__name__}")
+                            progress_bar.update(1)
+                            with open('liked_posts.json', 'w') as f:
+                                json.dump(liked_data, f, indent=4)
+                            continue
+
+                        # Support nested string_list_data format and flat href format.
+                        # In the flat format the post dict itself carries 'href' directly,
+                        # so we wrap it in a list so that string_list[0]['href'] works
+                        # uniformly for both formats below.
                         string_list = post.get('string_list_data') or []
+                        if not string_list and post.get('href'):
+                            string_list = [post]
                         if not string_list or not string_list[0].get('href'):
                             logging.warning(f"Skipping post with missing or empty 'string_list_data' (title: {post.get('title', 'unknown')})")
                             progress_bar.update(1)
                             with open('liked_posts.json', 'w') as f:
                                 json.dump(liked_data, f, indent=4)
                             continue
+
+                        # Only sleep before making an actual API call
+                        base_delay = random.uniform(CONFIG['delay']['min'], CONFIG['delay']['max'])
+                        actual_delay = base_delay * CONFIG['accounts'][username].get('delay_multiplier', 1.0)
+                        time.sleep(actual_delay)
+
                         media_id = instagram_code_to_media_id(string_list[0]['href'])
                         
                         # Unlike with retry mechanism and detailed error logging
