@@ -69,6 +69,13 @@ A powerful and free open-source Instagram automation tool for managing your digi
    - Locate `liked_posts.json` in the extracted files
    - Copy `liked_posts.json` to the InstaMassUnliker folder
 
+2. **Get Your Instagram Session ID** *(required for login)*
+   - Open [Instagram](https://www.instagram.com) in your browser and log in.
+   - Open Developer Tools (`F12` on Windows/Linux, `Cmd+Option+I` on Mac).
+   - Navigate to **Application** → **Cookies** → `https://www.instagram.com`.
+   - Find the cookie named `sessionid` and copy its value.
+   - You will be asked to paste this when adding your account in the tool.
+
 ### Windows Users
 ```bash
 1. Download & Extract
@@ -139,7 +146,7 @@ The installer handles all dependencies automatically:
 1. **Installation**
    - Windows: Run `run.bat`
    - macOS/Linux: Execute `run.sh`
-2. **Setup**: Add Instagram Account, then provide your login credentials, and then start the unliking process
+2. **Setup**: Add Instagram Account, then provide your `sessionid` browser cookie, and then start the unliking process
 3. **Operation**: Follow the interactive dashboard
 4. **Monitoring**: Track progress in real-time
 
