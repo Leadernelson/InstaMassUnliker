@@ -471,7 +471,7 @@ class InstagramUnliker:
                         post = liked_data['likes_media_likes'].pop(0)
                         string_list = post.get('string_list_data') or []
                         if not string_list or not string_list[0].get('href'):
-                            logging.warning(f"Skipping post with missing or empty 'string_list_data': {post}")
+                            logging.warning(f"Skipping post with missing or empty 'string_list_data' (title: {post.get('title', 'unknown')})")
                             progress_bar.update(1)
                             with open('liked_posts.json', 'w') as f:
                                 json.dump(liked_data, f, indent=4)
