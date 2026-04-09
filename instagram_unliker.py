@@ -440,6 +440,10 @@ class InstagramUnliker:
                 with open('liked_posts.json', 'r') as f:
                     liked_data = json.load(f)
                     
+                # Support both list format and dict format from Instagram data export
+                if isinstance(liked_data, list):
+                    liked_data = {'likes_media_likes': liked_data}
+
                 if not liked_data.get('likes_media_likes'):
                     error_msg = "No liked posts found in JSON file"
                     logging.warning(error_msg)
