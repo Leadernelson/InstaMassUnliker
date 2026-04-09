@@ -20,6 +20,7 @@ import urllib.request
 import tempfile
 from logging.handlers import RotatingFileHandler
 import atexit
+import re
 
 # Global logging configuration
 logging.basicConfig(
@@ -31,18 +32,21 @@ logging.basicConfig(
 # Global variables for configuration
 CONFIG = {
     "delay": {
-        "min": 60,  # 1 minutes minimum
-        "max": 300,  # 5 minutes maximum
+        "min": 2,  # 2 seconds minimum
+        "max": 6,  # 6 seconds maximum
     },
     "break": {
-        "min": 900,  # 15 minutes
-        "max": 3600,  # 1 hour
-        "probability": 0.1  # 10% chance of taking a break
+        "min": 120,  # 2 minutes
+        "max": 480,  # 8 minutes
+        "probability": 0.001  # 0.1% chance of taking a break
     },
     "accounts": {},
     "log_level": "INFO",
     "max_retries": 3,
-    "retry_delay": 60,  # 1 minute
+    "retry_delay": 20,  # 20 seconds
+    "error_cooldown": 30,  # 30 seconds after a failed unlike
+    "checkpoint_every": 25,  # Save liked_posts.json every N processed items
+    "stop_on_unlike_failure": True,  # Keep failed post in queue and stop run
     "auto_update": True,
     "python_min_version": "3.7.0"  # Minimum required Python version
 }
@@ -70,6 +74,9 @@ class InstagramUnliker:
         self.accounts_dir = Path("accounts")
         self.logs_dir = Path("logs")
         self.running = True
+        self.unlike_in_progress = False
+        self.stop_requested = False
+        self.stop_flag_file = Path("stop_unliker.flag")
         
         # Create necessary directories
         self._create_required_directories()
@@ -116,10 +123,55 @@ class InstagramUnliker:
         
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully"""
+        if self.unlike_in_progress:
+            if self.stop_requested:
+                print(f"\n{ConsoleColors.RED}[!] Second interrupt received. Forcing immediate exit...{ConsoleColors.RESET}")
+                logging.warning("Forced exit requested by second interrupt during unlike run")
+                sys.exit(1)
+
+            print(
+                f"\n{ConsoleColors.YELLOW}[!] Safe stop requested. Finishing current action and saving progress."
+                f" Press Ctrl+C again to force exit.{ConsoleColors.RESET}"
+            )
+            logging.info("Safe stop requested by signal during unlike run")
+            self.stop_requested = True
+            self.running = False
+            return
+
         print(f"\n{ConsoleColors.YELLOW}[!] Received shutdown signal. Cleaning up...{ConsoleColors.RESET}")
         self.running = False
-        time.sleep(1)  # Give time for cleanup
+        time.sleep(0.2)
         sys.exit(0)
+
+    def _poll_stop_signal(self) -> bool:
+        """Check for stop requests from signals or stop flag file."""
+        if self.stop_flag_file.exists():
+            print(f"\n{ConsoleColors.YELLOW}[!] Stop flag detected. Finishing safely...{ConsoleColors.RESET}")
+            logging.info(f"Safe stop requested using stop flag file: {self.stop_flag_file}")
+            self.stop_requested = True
+            self.running = False
+            try:
+                self.stop_flag_file.unlink()
+            except OSError:
+                logging.warning("Could not remove stop flag file", exc_info=True)
+
+        return (not self.running) or self.stop_requested
+
+    def _sleep_with_stop(self, seconds: float) -> bool:
+        """Sleep in small intervals to respond quickly to safe-stop requests."""
+        duration = max(0.0, float(seconds))
+        end_time = time.time() + duration
+
+        while time.time() < end_time:
+            if self._poll_stop_signal():
+                return False
+
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
+
+        return not self._poll_stop_signal()
         
     def setup_logging(self):
         """Configure logging with enhanced rotation and cleanup"""
@@ -384,23 +436,62 @@ class InstagramUnliker:
         except Exception as e:
             print(f"{ConsoleColors.RED}[✗] Failed to save configuration: {str(e)}{ConsoleColors.RESET}")
 
+    def _write_unlike_audit(
+        self,
+        username: str,
+        action: str,
+        post: Optional[Dict[str, Any]] = None,
+        **details: Any,
+    ):
+        """Append a structured audit event for unlike processing."""
+        try:
+            payload: Dict[str, Any] = {
+                "timestamp": datetime.now().isoformat(),
+                "username": username,
+                "action": action,
+            }
+
+            if isinstance(post, dict):
+                payload["post_fbid"] = post.get("fbid")
+                payload["post_url"] = extract_first_instagram_url(post)
+                payload["post_title"] = post.get("title")
+
+            payload.update(details)
+
+            audit_file = self.logs_dir / "unlike_audit.jsonl"
+            with open(audit_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception:
+            logging.warning("Failed to write unlike audit event", exc_info=True)
+
     def unlike_posts(self, username: str):
         """Unlike posts using JSON file"""
         account_file = self.accounts_dir / f"{username}.json"
         progress_bar = None  # Initialize progress_bar at the beginning of the method
+        save_checkpoint = None
+        likes_list: List[Any] = []
+        total_posts = 0
+        account_data: Dict[str, Any] = {}
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
         
         if not account_file.exists():
             error_msg = f"Account file not found for {username}"
             logging.error(error_msg)
             print(f"\n{ConsoleColors.RED}[✗] {error_msg}. Please add it first.{ConsoleColors.RESET}")
             return
+
+        # Reset run-state flags for this unlike execution
+        self.running = True
+        self.stop_requested = False
+        self.unlike_in_progress = True
             
         try:
             with open(account_file, 'r') as f:
                 account_data = json.load(f)
             
             print(f"\n{ConsoleColors.CYAN}Starting to unlike posts for @{username}...{ConsoleColors.RESET}")
-            print(f"{ConsoleColors.YELLOW}This will run in the background. You can close anytime.{ConsoleColors.RESET}")
+            print(f"{ConsoleColors.YELLOW}Safe stop: press Ctrl+C once, or create '{self.stop_flag_file.name}' in this folder.{ConsoleColors.RESET}")
+            print(f"{ConsoleColors.YELLOW}Your progress is checkpointed and remaining posts stay in liked_posts.json.{ConsoleColors.RESET}")
             
             try:
                 from ensta import WebSession
@@ -437,7 +528,7 @@ class InstagramUnliker:
                 return
 
             try:
-                with open('liked_posts.json', 'r') as f:
+                with open('liked_posts.json', 'r', encoding='utf-8') as f:
                     liked_data = json.load(f)
                     
                 # Support both list format and dict format from Instagram data export
@@ -451,148 +542,392 @@ class InstagramUnliker:
                             flattened.append(item)
                     liked_data = {'likes_media_likes': flattened}
 
-                if not liked_data.get('likes_media_likes'):
+                likes_list = liked_data.get('likes_media_likes') if isinstance(liked_data, dict) else None
+                if not isinstance(likes_list, list) or not likes_list:
                     error_msg = "No liked posts found in JSON file"
                     logging.warning(error_msg)
                     print(f"{ConsoleColors.YELLOW}[!] {error_msg}!{ConsoleColors.RESET}")
                     return
                     
-                total_posts = len(liked_data['likes_media_likes'])
-                first_likes_media_likes = total_posts
+                total_posts = len(likes_list)
                 unliked_count = 0
+                skipped_count = 0
+                failed_count = 0
+                processed_since_save = 0
+
+                def as_float(value: Any, default: float) -> float:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return default
+
+                checkpoint_every = max(1, int(as_float(CONFIG.get('checkpoint_every', 25), 25)))
+                checkpoint_max_interval = 20.0
+                last_checkpoint_time = time.time()
+                max_retries = max(1, int(as_float(CONFIG.get('max_retries', 3), 3)))
+                retry_delay = max(0.0, as_float(CONFIG.get('retry_delay', 60), 60))
+                error_cooldown = max(0.0, as_float(CONFIG.get('error_cooldown', 30), 30))
+                stop_on_unlike_failure = bool(CONFIG.get('stop_on_unlike_failure', True))
+
+                def save_checkpoint(force: bool = False):
+                    nonlocal processed_since_save, last_checkpoint_time
+                    now = time.time()
+                    should_save = force or processed_since_save >= checkpoint_every
+                    should_save = should_save or (processed_since_save > 0 and (now - last_checkpoint_time) >= checkpoint_max_interval)
+                    if not should_save:
+                        return
+
+                    with open('liked_posts.json', 'w', encoding='utf-8') as f:
+                        json.dump(liked_data, f, indent=4)
+
+                    processed_since_save = 0
+                    last_checkpoint_time = now
+
+                account_config = CONFIG['accounts'].get(username, {})
+                delay_multiplier = as_float(account_config.get('delay_multiplier', 1.0), 1.0)
+                delay_min = as_float(CONFIG['delay'].get('min', 0), 0)
+                delay_max = as_float(CONFIG['delay'].get('max', delay_min), delay_min)
+                base_min_delay = max(0.0, min(delay_min, delay_max))
+                base_max_delay = max(0.0, max(delay_min, delay_max))
+                effective_min_delay = base_min_delay * delay_multiplier
+                effective_max_delay = base_max_delay * delay_multiplier
+
+                break_probability = as_float(CONFIG['break'].get('probability', 0), 0)
+                break_probability = max(0.0, min(1.0, break_probability))
+                break_min = max(0.0, as_float(CONFIG['break'].get('min', 0), 0))
+                break_max = max(break_min, as_float(CONFIG['break'].get('max', break_min), break_min))
+
+                estimated_seconds = total_posts * ((effective_min_delay + effective_max_delay) / 2)
+                estimated_hours = estimated_seconds / 3600 if estimated_seconds > 0 else 0
+                estimated_break_seconds = total_posts * break_probability * ((break_min + break_max) / 2)
+                estimated_break_hours = estimated_break_seconds / 3600 if estimated_break_seconds > 0 else 0
 
                 print(f"{ConsoleColors.BLUE}Found {total_posts} liked posts{ConsoleColors.RESET}")
+                print(
+                    f"{ConsoleColors.BLUE}Configured delay: {effective_min_delay:.2f}s to {effective_max_delay:.2f}s per unlike"
+                    f"{ConsoleColors.RESET}"
+                )
+
+                if estimated_hours >= 1:
+                    print(f"{ConsoleColors.YELLOW}[!] Estimated runtime with current delay: {estimated_hours:.1f} hours{ConsoleColors.RESET}")
+
+                if estimated_break_hours >= 1:
+                    print(
+                        f"{ConsoleColors.YELLOW}[!] Expected extra break time: ~{estimated_break_hours:.1f} hours"
+                        f" (probability {break_probability * 100:.3f}% per item).{ConsoleColors.RESET}"
+                    )
+
+                if estimated_hours >= 6:
+                    print(
+                        f"{ConsoleColors.YELLOW}[!] This run may take very long with your current delay settings.{ConsoleColors.RESET}"
+                    )
+                    try:
+                        quick_mode = input(
+                            f"{ConsoleColors.BOLD}Enable temporary quick mode for this run (0.8s to 2.0s delay)? [Y/n]: {ConsoleColors.RESET}"
+                        ).strip().lower()
+                    except EOFError:
+                        quick_mode = 'n'
+
+                    if quick_mode in ('', 'y', 'yes'):
+                        effective_min_delay = 0.8
+                        effective_max_delay = 2.0
+                        print(
+                            f"{ConsoleColors.GREEN}✓ Quick mode enabled for this run only"
+                            f" (delay {effective_min_delay:.1f}s to {effective_max_delay:.1f}s).{ConsoleColors.RESET}"
+                        )
                 
                 progress_bar = tqdm(
                     total=total_posts,
                     desc=f"🔄 Unliking posts",
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [ETA: {remaining}]'
                 )
+
+                def update_progress_postfix():
+                    if progress_bar is not None:
+                        progress_bar.set_postfix_str(
+                            f"unliked={unliked_count} skipped={skipped_count} failed={failed_count}",
+                            refresh=False
+                        )
+
+                update_progress_postfix()
+
+                self._write_unlike_audit(
+                    username,
+                    "run_started",
+                    run_id=run_id,
+                    total_posts=total_posts,
+                    delay_min=effective_min_delay,
+                    delay_max=effective_max_delay,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    stop_on_unlike_failure=stop_on_unlike_failure,
+                )
                 
-                while liked_data['likes_media_likes'] and self.running:
+                while likes_list and self.running:
+                    if self._poll_stop_signal():
+                        break
+
                     try:
-                        post = liked_data['likes_media_likes'].pop(0)
+                        # Peek first item and only dequeue after a definite outcome.
+                        post = likes_list[0]
 
                         # Guard against non-dict entries (e.g. list-of-lists export format)
                         if not isinstance(post, dict):
-                            logging.warning(f"Skipping post with unexpected format: {type(post).__name__}")
+                            reason = f"unexpected_post_type:{type(post).__name__}"
+                            logging.warning(f"Skipping post with {reason}")
+                            self._write_unlike_audit(
+                                username,
+                                "skipped",
+                                run_id=run_id,
+                                reason=reason,
+                                dequeued=True,
+                                remaining_posts=len(likes_list) - 1,
+                            )
+
+                            likes_list.pop(0)
+                            processed_since_save += 1
+                            skipped_count += 1
                             progress_bar.update(1)
-                            with open('liked_posts.json', 'w') as f:
-                                json.dump(liked_data, f, indent=4)
+                            update_progress_postfix()
+                            save_checkpoint()
                             continue
 
-                        # Support multiple Instagram data-export formats:
-                        #  - string_list_data[0]['href']  (classic format)
-                        #  - string_list_data[0]['value'] (some newer exports)
-                        #  - string_list_data[0] as a plain list ["url", ...]
-                        #  - post['href'] directly (flat format)
-                        #  - post['title'] containing the URL (some newer exports)
-                        string_list = post.get('string_list_data') or []
-
-                        # Normalise list-of-lists: [["https://...", ...]] → [{'href': 'https://...'}]
-                        if string_list and isinstance(string_list[0], list):
-                            nested_list = string_list[0]
-                            extracted_url = next(
-                                (v for v in nested_list if isinstance(v, str) and v.startswith('http')),
-                                None
+                        media_id, media_source = extract_media_id_from_post(post)
+                        if media_id is None:
+                            logging.warning(
+                                "Skipping post with no usable media identifier "
+                                f"(title: {post.get('title', 'unknown')}, fbid: {post.get('fbid', 'none')})"
                             )
-                            string_list = [{'href': extracted_url}] if extracted_url else []
+                            self._write_unlike_audit(
+                                username,
+                                "skipped",
+                                post=post,
+                                run_id=run_id,
+                                reason="no_media_identifier",
+                                dequeued=True,
+                                remaining_posts=len(likes_list) - 1,
+                            )
 
-                        if not string_list and post.get('href'):
-                            string_list = [post]
-
-                        # Resolve the post URL from the best available field
-                        post_url = None
-                        if string_list and isinstance(string_list[0], dict):
-                            entry = string_list[0]
-                            post_url = entry.get('href') or entry.get('value') or entry.get('uri')
-                            if post_url and not str(post_url).startswith('http'):
-                                post_url = None
-
-                        # Fall back to the 'title' field if it looks like a URL
-                        if not post_url:
-                            title = post.get('title', '')
-                            if title and str(title).startswith('http'):
-                                post_url = title
-
-                        if not post_url:
-                            logging.warning(f"Skipping post with missing or empty 'string_list_data' (title: {post.get('title', 'unknown')})")
+                            likes_list.pop(0)
+                            processed_since_save += 1
+                            skipped_count += 1
                             progress_bar.update(1)
-                            with open('liked_posts.json', 'w') as f:
-                                json.dump(liked_data, f, indent=4)
+                            update_progress_postfix()
+                            save_checkpoint()
                             continue
 
                         # Only sleep before making an actual API call
-                        base_delay = random.uniform(CONFIG['delay']['min'], CONFIG['delay']['max'])
-                        actual_delay = base_delay * CONFIG['accounts'][username].get('delay_multiplier', 1.0)
-                        time.sleep(actual_delay)
+                        if effective_max_delay > 0:
+                            delay_for_this_item = random.uniform(effective_min_delay, effective_max_delay)
+                            if not self._sleep_with_stop(delay_for_this_item):
+                                break
 
-                        media_id = instagram_code_to_media_id(post_url)
-                        
+                        if self._poll_stop_signal():
+                            break
+
                         # Unlike with retry mechanism and detailed error logging
-                        for retry in range(CONFIG['max_retries']):
+                        unlike_success = False
+                        unlike_result: Any = None
+                        retry_error_message = "Unknown unlike failure"
+
+                        for retry in range(max_retries):
+                            if self._poll_stop_signal():
+                                break
+
                             try:
-                                client.unlike(media_id)
+                                unlike_result = client.unlike(media_id)
+                                unlike_success = True
                                 break
                             except Exception as e:
-                                error_msg = f"Failed to unlike post (attempt {retry + 1}/{CONFIG['max_retries']}): {str(e)}"
-                                logging.warning(error_msg)
-                                if retry < CONFIG['max_retries'] - 1:
-                                    print(f"{ConsoleColors.YELLOW}[!] {error_msg}. Retrying...{ConsoleColors.RESET}")
-                                    time.sleep(CONFIG['retry_delay'])
-                                else:
-                                    raise Exception(error_msg)
+                                retry_error_message = (
+                                    f"Failed to unlike post from {media_source} "
+                                    f"(attempt {retry + 1}/{max_retries}): {str(e)}"
+                                )
+                                logging.warning(retry_error_message)
+                                if retry < max_retries - 1:
+                                    print(f"{ConsoleColors.YELLOW}[!] {retry_error_message}. Retrying...{ConsoleColors.RESET}")
+                                    if retry_delay > 0:
+                                        if not self._sleep_with_stop(retry_delay):
+                                            break
+
+                        if self._poll_stop_signal():
+                            break
+
+                        if not unlike_success:
+                            failed_count += 1
+                            account_data['last_error'] = retry_error_message
+                            logging.error(
+                                "Unlike failed; post kept in queue for future retry. media_id=%s source=%s reason=%s",
+                                media_id,
+                                media_source,
+                                retry_error_message,
+                            )
+                            self._write_unlike_audit(
+                                username,
+                                "failed_kept",
+                                post=post,
+                                run_id=run_id,
+                                media_id=str(media_id),
+                                media_source=media_source,
+                                reason=retry_error_message,
+                                dequeued=False,
+                                remaining_posts=len(likes_list),
+                            )
+
+                            update_progress_postfix()
+                            print(f"{ConsoleColors.RED}[✗] Failed to unlike current post; it was kept in queue.{ConsoleColors.RESET}")
+                            print(f"{ConsoleColors.YELLOW}Reason: {retry_error_message}{ConsoleColors.RESET}")
+
+                            if stop_on_unlike_failure:
+                                print(
+                                    f"{ConsoleColors.YELLOW}[!] Stopping safely to avoid skipping this post."
+                                    f" Re-run later to retry from the same item.{ConsoleColors.RESET}"
+                                )
+                                self.stop_requested = True
+                                self.running = False
+                            elif error_cooldown > 0:
+                                print(
+                                    f"{ConsoleColors.YELLOW}[!] Waiting {error_cooldown:.0f}s before retrying the same post..."
+                                    f"{ConsoleColors.RESET}"
+                                )
+                                self._sleep_with_stop(error_cooldown)
+
+                            continue
+
+                        # Success: dequeue and persist progress
+                        likes_list.pop(0)
+                        processed_since_save += 1
 
                         unliked_count += 1
-                        account_data['total_unliked'] += 1
+                        account_data['total_unliked'] = account_data.get('total_unliked', 0) + 1
+                        account_data['last_error'] = None
                         progress_bar.update(1)
-                        
-                        # Update JSON file
-                        with open('liked_posts.json', 'w') as f:
-                            json.dump(liked_data, f, indent=4)
+                        update_progress_postfix()
+                        save_checkpoint()
+
+                        api_result = repr(unlike_result)
+                        if len(api_result) > 200:
+                            api_result = api_result[:200] + "..."
+
+                        logging.info(
+                            "Unlike succeeded. media_id=%s source=%s remaining=%s",
+                            media_id,
+                            media_source,
+                            len(likes_list),
+                        )
+                        self._write_unlike_audit(
+                            username,
+                            "unliked",
+                            post=post,
+                            run_id=run_id,
+                            media_id=str(media_id),
+                            media_source=media_source,
+                            retries_used=retry + 1,
+                            api_result=api_result,
+                            dequeued=True,
+                            remaining_posts=len(likes_list),
+                        )
                         
                         # Random break
-                        if random.random() < CONFIG['break']['probability']:
-                            break_time = random.uniform(CONFIG['break']['min'], CONFIG['break']['max'])
+                        if random.random() < break_probability:
+                            break_time = random.uniform(break_min, break_max)
                             print(f"\n{ConsoleColors.BLUE}[*] Taking a break for {break_time/60:.1f} minutes...{ConsoleColors.RESET}")
-                            time.sleep(break_time)
+                            if not self._sleep_with_stop(break_time):
+                                break
                             
                     except Exception as e:
                         error_msg = f"Failed to unlike post: {str(e)}"
-                        logging.error(error_msg, exc_info=True)  # Include full traceback in logs
+                        logging.error(error_msg, exc_info=True)
+                        failed_count += 1
+                        update_progress_postfix()
                         print(f"{ConsoleColors.RED}[✗] {error_msg}")
-                        print(f"→ Taking a 5-minute cooldown...{ConsoleColors.RESET}")
                         account_data['last_error'] = error_msg
-                        time.sleep(300)  # 5 minute cooldown on error
+                        self._write_unlike_audit(
+                            username,
+                            "failed_kept",
+                            post=post if isinstance(post, dict) else None,
+                            run_id=run_id,
+                            reason=error_msg,
+                            dequeued=False,
+                            remaining_posts=len(likes_list),
+                        )
+
+                        if stop_on_unlike_failure:
+                            print(
+                                f"{ConsoleColors.YELLOW}[!] Stopping safely. Current post is still queued in liked_posts.json.{ConsoleColors.RESET}"
+                            )
+                            self.stop_requested = True
+                            self.running = False
+                        elif error_cooldown > 0:
+                            print(f"→ Taking a {error_cooldown:.0f}-second cooldown...{ConsoleColors.RESET}")
+                            self._sleep_with_stop(error_cooldown)
                         
             finally:
+                if callable(save_checkpoint):
+                    try:
+                        save_checkpoint(force=True)
+                    except Exception as checkpoint_error:
+                        logging.warning(f"Failed to persist checkpoint: {str(checkpoint_error)}")
+
                 if progress_bar is not None:
                     progress_bar.close()
                 
             # Update account stats
             account_data['last_run'] = datetime.now().isoformat()
-            with open(account_file, 'w') as f:
+            with open(account_file, 'w', encoding='utf-8') as f:
                 json.dump(account_data, f, indent=4)
-                
-            print(f"\n{ConsoleColors.GREEN}[✓] Unliking complete for {username}{ConsoleColors.RESET}")
+
+            if self.stop_requested:
+                print(
+                    f"\n{ConsoleColors.YELLOW}[!] Safe stop complete for {username}."
+                    f" Remaining posts were preserved.{ConsoleColors.RESET}"
+                )
+            else:
+                print(f"\n{ConsoleColors.GREEN}[✓] Unliking complete for {username}{ConsoleColors.RESET}")
+
             print(f"{ConsoleColors.BLUE}[*] Total unliked: {account_data['total_unliked']}{ConsoleColors.RESET}")
+            print(
+                f"{ConsoleColors.BLUE}[*] Run summary: "
+                f"processed={total_posts - len(likes_list)}/{total_posts}, "
+                f"unliked={unliked_count}, skipped={skipped_count}, failed={failed_count}{ConsoleColors.RESET}"
+            )
+            print(f"{ConsoleColors.BLUE}[*] Remaining posts in queue: {len(likes_list)}{ConsoleColors.RESET}")
+
+            self._write_unlike_audit(
+                username,
+                "run_finished",
+                run_id=run_id,
+                total_posts=total_posts,
+                processed=(total_posts - len(likes_list)),
+                unliked=unliked_count,
+                skipped=skipped_count,
+                failed=failed_count,
+                remaining_posts=len(likes_list),
+                stop_requested=self.stop_requested,
+            )
             
         except json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON format in account file: {str(e)}"
+            error_msg = f"Invalid JSON format: {str(e)}"
             logging.error(error_msg)
             print(f"{ConsoleColors.RED}[✗] {error_msg}")
-            print("→ Try removing and re-adding your account.{ConsoleColors.RESET}")
+            print(f"→ Your liked_posts.json or account file may be corrupted or truncated.")
+            print(f"→ Try re-exporting your Instagram data or re-adding your account.{ConsoleColors.RESET}")
         except Exception as e:
             error_msg = f"Unexpected error: {str(e)}"
             logging.error(error_msg, exc_info=True)  # Include full traceback in logs
             print(f"\n{ConsoleColors.RED}[✗] {error_msg}")
             print("→ The error has been logged. Please check the logs for details.{ConsoleColors.RESET}")
             try:
-                account_data['last_error'] = error_msg
-                with open(account_file, 'w') as f:
-                    json.dump(account_data, f, indent=4)
-            except:
+                if account_data:
+                    account_data['last_error'] = error_msg
+                    with open(account_file, 'w') as f:
+                        json.dump(account_data, f, indent=4)
+            except Exception:
                 logging.error("Failed to save error information to account file", exc_info=True)
+        finally:
+            self.unlike_in_progress = False
+            self.running = True
+            self.stop_requested = False
 
     def center_text_in_box(text, box_width=48):
         """Center text in a box line, accounting for color codes"""
@@ -974,16 +1309,89 @@ def ensure_python_installed():
         print(f"Error checking/installing Python: {str(e)}")
         sys.exit(1)
 
-def instagram_code_to_media_id(code):
-    """Convert Instagram shortcode to media ID"""
+def extract_first_instagram_url(data: Any) -> Optional[str]:
+    """Recursively search nested structures for the first Instagram URL."""
+    if isinstance(data, dict):
+        for key in ('href', 'value', 'uri', 'url', 'link', 'title'):
+            value = data.get(key)
+            if isinstance(value, str):
+                candidate = value.strip()
+                if candidate.startswith('http') and 'instagram.com' in candidate:
+                    return candidate
+
+        for value in data.values():
+            found = extract_first_instagram_url(value)
+            if found:
+                return found
+
+    elif isinstance(data, list):
+        for item in data:
+            found = extract_first_instagram_url(item)
+            if found:
+                return found
+
+    elif isinstance(data, str):
+        candidate = data.strip()
+        if candidate.startswith('http') and 'instagram.com' in candidate:
+            return candidate
+
+    return None
+
+
+def extract_media_id_from_post(post: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+    """Extract media ID from known Instagram export fields."""
+    if not isinstance(post, dict):
+        return None, None
+
+    fbid = post.get('fbid')
+    if fbid is not None:
+        try:
+            return int(str(fbid)), 'fbid'
+        except (TypeError, ValueError):
+            pass
+
+    for field in ('string_list_data', 'label_values', 'href', 'title', 'media'):
+        url = extract_first_instagram_url(post.get(field))
+        if not url:
+            continue
+
+        try:
+            return instagram_code_to_media_id(url), 'url'
+        except ValueError:
+            continue
+
+    url = extract_first_instagram_url(post)
+    if url:
+        try:
+            return instagram_code_to_media_id(url), 'url'
+        except ValueError:
+            pass
+
+    return None, None
+
+
+def instagram_code_to_media_id(code_or_url: str) -> int:
+    """Convert Instagram URL or shortcode to media ID."""
     charmap = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
-    code = code.split('/')[-2]
-    return sum(charmap.index(char) * (64 ** i) for i, char in enumerate(reversed(code)))
+
+    if not isinstance(code_or_url, str) or not code_or_url.strip():
+        raise ValueError("Empty Instagram URL/shortcode")
+
+    text = code_or_url.strip()
+    match = re.search(r'/(?:p|reel|tv)/([A-Za-z0-9_-]+)', text)
+    if match:
+        shortcode = match.group(1)
+    else:
+        shortcode = text.rstrip('/').split('/')[-1].split('?')[0]
+
+    if not shortcode or any(char not in charmap for char in shortcode):
+        raise ValueError(f"Invalid Instagram shortcode: {code_or_url}")
+
+    return sum(charmap.index(char) * (64 ** i) for i, char in enumerate(reversed(shortcode)))
 
 def get_visible_length(text):
     """Calculate the visible length of text by removing ANSI color codes"""
     # Pattern to match ANSI escape sequences
-    import re
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return len(ansi_escape.sub('', text))
 
